@@ -6,6 +6,12 @@ The SAS-wsm utility provides consistent management of SAS-related services for W
 
 ### What's New
 
+SAS-wsm 2.2.0:
+
+* Daily audit log records the run result, service order, per-service timing, and services that were left out. A failed run exits 1.
+* Optional `-LogDirectory` chooses where `SAS-wsm_yyyyMMdd.log` is written. The default is the script folder.
+* Double-click launchers for status, start, and stop.
+
 SAS-wsm 2.1.1 release:
 
 * Merge audit-logging function contributed by Dustin Polk (PR #4)
@@ -31,7 +37,21 @@ Provide the following input parameters as shown:
 
 .\SAS-wsm.ps1 -action \<start|stop|status\>
 
-Additional input parameters are available for optional/extended functionality. Refer to setup documentation for details.
+Optional parameters:
+
+* `-saslev C:\SAS\Config\Lev1` — SAS configuration directory, including `LevN`. Used to confirm Web Application Server startup.
+* `-cfg C:\path\example-servers.cfg` — custom service order. Names must match the Windows service display name exactly.
+* `-LogDirectory C:\SAS\Logs` — folder for the daily audit log. Default is the folder that contains `SAS-wsm.ps1`. The file is named `SAS-wsm_yyyyMMdd.log`.
+
+Each run ends with one summary line: result, action, how many services were processed, changed, skipped, or failed, and how long it took. Start and stop return exit code 1 when no service matches, or when a service does not reach the requested state.
+
+### Click to run
+
+In the script folder:
+
+* `SAS-wsm-status.bat` — show service status. The window stays open.
+* `SAS-wsm-start.bat` — start services. Windows asks for administrator approval.
+* `SAS-wsm-stop.bat` — stop services. Windows asks for administrator approval.
 
 ### Examples
 
@@ -40,6 +60,8 @@ Additional input parameters are available for optional/extended functionality. R
 * Stop services: `.\SAS-wsm.ps1 -action stop`
 
 * Check service status: `.\SAS-wsm.ps1 -action status`
+
+* Start and write the log somewhere else: `.\SAS-wsm.ps1 -action start -LogDirectory D:\SAS\logs`
 
 ## Contributing
 

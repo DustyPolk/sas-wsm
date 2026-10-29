@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # SAS-wsm: Script to Start/Stop Windows Services and validate MidTier Readiness
-# Version: 2.0.1
+# Version: 2.2.0
 # Author: Andy Foreman
 # Much of the baseline code derived from previous work by Greg Wootton on 20AUG2020
 # Special thanks to John Maxwell for auto-setup start/stop concept implemented in 2.0.0 on 12JUL2023.
@@ -14,22 +14,42 @@
 # 2.0.0 - 12 July 2023. Major revisions/rewrite. Merge with auto-setup start/stop script. Add supporting functions and parameters. Retain external cfg as optional support. Remove external cfg tester action.
 # 2.1.0 - 29 May 2025. Added detailed audit logging
 # 2.1.1 - 16 June 2026. Un-archive project. Merge v.2.1.0 / PR #4 audit logging contributions into main branch. Confirm operations on modern SAS 9.4 maintenance releases. Adjust default startup order to improve startup success of critical services (i.e. when some non-critical services are non-operational).
+# 2.2.0 - 29 October 2026. Configurable daily audit log, per-service timing, run summary, and non-zero exit on failure. Click-to-run start/stop/status launchers.
 
 ### TODOS
 # Implement "skip" function to permit a user to ignore the state/status/control-failure of a specific service
-# Document and improve audit logging file-creation definition parameters
 
 ### GET USER INPUTS
 # Get user-specified action as input
 # $action = <start|stop|status> [required]
 # $saslev = ....\SASConfig\LevN path. Used to verify WebAppServer startup. Script will attempt to determine this if not specified. Example: C:\SAS\Config\Lev1
 # $cfg = Custom startup order configuration file. Default order is defined in this file and will be used if not specified.
-param([Parameter(Mandatory=$true)]$action,$saslev,$cfg)
+# $LogDirectory = Folder for the daily audit log. Default is the folder that contains this script. File name: SAS-wsm_yyyyMMdd.log
+param([Parameter(Mandatory=$true)]$action,$saslev,$cfg,$LogDirectory)
 
 ### AUDIT LOGGING SETUP
-# Initialize log file in same directory as script
-$script:LogPath = Join-Path -Path $PSScriptRoot -ChildPath "SAS-wsm_$(Get-Date -Format 'yyyyMMdd').log"
+# One log file per day. -LogDirectory overrides the default (this script's folder).
+$script:ScriptVersion = "2.2.0"
+$script:LogDirectory = $PSScriptRoot
+if ($LogDirectory) { $script:LogDirectory = $LogDirectory }
+if (-not $script:LogDirectory) { $script:LogDirectory = (Get-Location).Path }
+if (-not (Test-Path -LiteralPath $script:LogDirectory -PathType Container)) {
+	try {
+		New-Item -ItemType Directory -Path $script:LogDirectory -Force -ErrorAction Stop | Out-Null
+	}
+	catch {
+		Write-Host -ForegroundColor Red "ERROR: Unable to create log directory $($script:LogDirectory). $_"
+		Exit 1
+	}
+}
+$script:LogPath = Join-Path -Path $script:LogDirectory -ChildPath "SAS-wsm_$(Get-Date -Format 'yyyyMMdd').log"
 $script:SessionId = [guid]::NewGuid().ToString().Substring(0,8)
+$script:RunStarted = Get-Date
+$script:ServicesChanged = 0
+$script:ServicesSkipped = 0
+$script:ServicesFailed = 0
+$script:ServicesPlanned = 0
+$script:RunFailed = $false
 
 # Logging function
 FUNCTION Write-AuditLog {
@@ -54,23 +74,52 @@ FUNCTION Write-AuditLog {
     
     $logEntry += " $Message"
     
-    # Write to log file
+    # Write to log file. WARN and ERROR are also printed so a double-clicked launcher shows them.
     try {
         Add-Content -Path $script:LogPath -Value $logEntry -ErrorAction Stop
     }
     catch {
-        # If we can't write to log, at least output to console
-        Write-Host "LOGGING ERROR: $_"
+        Write-Host -ForegroundColor Red "LOGGING ERROR: $_"
+    }
+    if ($Level -eq "ERROR" -or $Level -eq "WARN") {
+        $consoleMessage = "${Level}: $Message"
+        if ($ServiceName) { $consoleMessage = "${Level}: [$ServiceName] $Message" }
+        if ($Level -eq "ERROR") { Write-Host -ForegroundColor Red $consoleMessage }
+        else { Write-Host -ForegroundColor Yellow $consoleMessage }
+    }
+}
+
+# Close a run with one summary line. Failed runs exit 1 so launchers and schedulers can see it.
+FUNCTION Complete-Run {
+    param([string]$Result)
+    $elapsed = (Get-Date) - $script:RunStarted
+    $elapsedText = $elapsed.ToString("hh\:mm\:ss")
+    $message = "SAS-wsm script ended result=$Result action=$action processed=$($script:ServicesPlanned) changed=$($script:ServicesChanged) skipped=$($script:ServicesSkipped) failed=$($script:ServicesFailed) duration=$elapsedText log=$($script:LogPath)"
+    if ($Result -eq "failed") {
+        Write-AuditLog -Level "ERROR" -Message $message -Action $action -Status $Result
+    }
+    else {
+        Write-AuditLog -Level "INFO" -Message $message -Action $action -Status $Result
+        Write-Host -ForegroundColor Green "SAS-wsm $action completed in $elapsedText. Audit log: $($script:LogPath)"
     }
 }
 
 # Log script startup
-Write-AuditLog -Level "INFO" -Message "SAS-wsm script started" -Action $action
-Write-AuditLog -Level "INFO" -Message "Parameters: action=$action, saslev=$saslev, cfg=$cfg"
+Write-Host "INFO: Audit log: $($script:LogPath)"
+Write-AuditLog -Level "INFO" -Message "SAS-wsm script started version=$($script:ScriptVersion)" -Action $action
+Write-AuditLog -Level "INFO" -Message "Parameters: action=$action, saslev=$saslev, cfg=$cfg, LogDirectory=$($script:LogDirectory)"
 
 
 #  define main function used to stop / start.  (called at end of script). 
 FUNCTION STOPSTART-SASSERVICE ($action,$service,$waitforstate){
+	if ($null -eq $service) {
+		$script:ServicesFailed++
+		$script:RunFailed = $true
+		Write-AuditLog -Level "ERROR" -Message "Service list contained an empty entry" -Action $action
+		throw "ERROR: service list contained an empty entry."
+	}
+	$service.Refresh()
+	$operationStarted = Get-Date
 	Write-AuditLog -Level "INFO" -Message "Processing service" -ServiceName $service.DisplayName -Action $action -Status $service.status
 	$timeoutSeconds=300 #5 minutes timeout
 	$serviceWaitTimeout = New-Object Timespan 0,0,$timeoutSeconds #define object to reference max allowed wait time (in seconds) for Windows to recieve notification that service completed action. This normally takes only a few seconds.
@@ -82,29 +131,35 @@ FUNCTION STOPSTART-SASSERVICE ($action,$service,$waitforstate){
         Write-Host "attempting to $action --  " $service.DisplayName
         Write-Output '-------------------------------------'
         If ($action -eq "stop"){
-            Write-AuditLog -Level "INFO" -Message "Attempting to stop service" -ServiceName $service.DisplayName
+            Write-AuditLog -Level "INFO" -Message "Attempting to stop service" -ServiceName $service.DisplayName -Action $action -Status $service.status
             Stop-Service -InputObject $service -WarningAction SilentlyContinue -ErrorAction Stop -NoWait #because -NoWait, will not hold here for Windows to report stopped. Check for actually stopped happens from $service.WaitForStatus
         }
         ElseIf ($action -eq "start"){
-            Write-AuditLog -Level "INFO" -Message "Attempting to start service" -ServiceName $service.DisplayName
+            Write-AuditLog -Level "INFO" -Message "Attempting to start service" -ServiceName $service.DisplayName -Action $action -Status $service.status
 			Start-Service -InputObject $service -WarningAction SilentlyContinue -ErrorAction Stop #the -NoWait parameter is not available on START operation. If Windows hangs on starting the service, this will too. Can start as background job to avoid this but has major complexity in passing $service object.
         }        
         start-sleep -s 3
 		Try {
 			$service.WaitForStatus($waitforstate, $serviceWaitTimeout) #await service to report desired status $waitforstate (stop, if we are stopping), or time out after $serviceWaitTimeout timespan object is exceeded. This is equal to $timeoutSeconds seconds
+			$elapsedSeconds = [math]::Round(((Get-Date) - $operationStarted).TotalSeconds, 1)
 			Write-Host $service.DisplayName "status is:-- " $service.status
-			Write-AuditLog -Level "INFO" -Message "Service action completed successfully" -ServiceName $service.DisplayName -Action $action -Status $service.status
+			Write-AuditLog -Level "INFO" -Message "Service action completed successfully in ${elapsedSeconds}s" -ServiceName $service.DisplayName -Action $action -Status $service.status
+			$script:ServicesChanged++
 			Write-Host "`n"
 		}
 		Catch {
-			Write-AuditLog -Level "ERROR" -Message "Service failed to reach $waitforstate state within $timeoutSeconds seconds" -ServiceName $service.DisplayName -Action $action
+			$elapsedSeconds = [math]::Round(((Get-Date) - $operationStarted).TotalSeconds, 1)
+			$script:ServicesFailed++
+			$script:RunFailed = $true
+			Write-AuditLog -Level "ERROR" -Message "Service failed to reach $waitforstate within $timeoutSeconds seconds (elapsed ${elapsedSeconds}s)" -ServiceName $service.DisplayName -Action $action -Status $service.status
 			throw "ERROR: $action terminated due to $($service.DisplayName) failed to report $waitforstate within $timeoutSeconds seconds."
-			#Exit 1 terminate inherent from throw
 		}
     }
     else {
+        $elapsedSeconds = [math]::Round(((Get-Date) - $operationStarted).TotalSeconds, 1)
         Write-Host "skipping $action action because service is already $waitforstate"
-        Write-AuditLog -Level "INFO" -Message "Skipping service - already in desired state" -ServiceName $service.DisplayName -Action $action -Status $waitforstate
+        Write-AuditLog -Level "INFO" -Message "Skipping service - already in desired state (${elapsedSeconds}s)" -ServiceName $service.DisplayName -Action $action -Status $waitforstate
+        $script:ServicesSkipped++
         Write-Output '-------------------------------------'
     }
     start-sleep -s 1
@@ -112,17 +167,29 @@ FUNCTION STOPSTART-SASSERVICE ($action,$service,$waitforstate){
 
 FUNCTION CHECK-WEBAPPSERVER-READY($servicename){
 	# wait for webappservers to finish deploying webapps before considering them truly started
-	Write-AuditLog -Level "INFO" -Message "Checking WebAppServer deployment status" -ServiceName $servicename
-
 	If ($script:sasconfigpath.length -gt 0) {
-		$webappsvrname =  $servicename | Where {$servicename -match '\b(SASServer\d+_\d+)\b'} | Foreach {$Matches[1]} #strange but functional command... split servicename into just webappserver name, such as SASServer1_1, using regex match looking for SASServer<digits>_<digits>
+		# Do not pipe the display name. PowerShell enumerates a string into characters.
+		$webappsvrname = $null
+		if ($servicename -match '\b(SASServer\d+_\d+)\b') {
+			$webappsvrname = $Matches[1]
+		}
+		if (-not $webappsvrname) {
+			Write-AuditLog -Level "WARN" -Message "Could not parse WebAppServer instance name; skipping deployment check" -ServiceName $servicename
+			return
+		}
+		$serverLog = Join-Path $script:sasconfigpath "Web\WebAppServer\$webappsvrname\logs\server.log"
+		if (-not (Test-Path -LiteralPath $serverLog -PathType Leaf)) {
+			Write-AuditLog -Level "WARN" -Message "WebAppServer log not found; skipping deployment check: $serverLog" -ServiceName $servicename
+			return
+		}
+		Write-AuditLog -Level "INFO" -Message "Checking WebAppServer deployment status in $serverLog" -ServiceName $servicename
 		Write-Host ("INFO: Checking if Web Application Server $webappsvrname has finished deploying web applications... (this may take a while)")
 
 		$startchecks=0;
 		$finishedstart=0;
 		Do {
 			#pull a list of line numbers from the WebAppServer's server log, matching string indicating server stop operation, then keep only the last member of the list (the latest matching line number)
-			$laststop = Select-String -Path "$script:sasconfigpath\Web\WebAppServer\$webappsvrname\logs\server.log" -Pattern 'Stopping service \[Catalina\]' | select-object -ExpandProperty LineNumber
+			$laststop = Select-String -Path $serverLog -Pattern 'Stopping service \[Catalina\]' | select-object -ExpandProperty LineNumber
 			if ($null -eq $laststop) {
 				#Enter here if we did not find any matches on the Pattern search, which can happen if the log file is new or rolled.
 				#In this instance, just consider the last action as line 0 for logic. lastinit should always be line 1 in this case. This prevents assigning on null arrays.
@@ -135,7 +202,7 @@ FUNCTION CHECK-WEBAPPSERVER-READY($servicename){
 			#same as laststop but for initialization message (printed when the server starts loading its webapps)
 			#message changes depending on hotfix level... old is 'Initialization processed' , new is 'Server initialization'
 			#if lastinit never finds a match, probably still on old version and need to change the string after -Pattern below to use the old syntax as shown above
-			$lastinit = Select-String -Path "$script:sasconfigpath\Web\WebAppServer\$webappsvrname\logs\server.log" -Pattern '(Server initialization)|(Initialization processed)' | select-object -ExpandProperty LineNumber
+			$lastinit = Select-String -Path $serverLog -Pattern '(Server initialization)|(Initialization processed)' | select-object -ExpandProperty LineNumber
 			if ($null -eq $lastinit) {
 				$lastinit=0
 			}
@@ -144,7 +211,7 @@ FUNCTION CHECK-WEBAPPSERVER-READY($servicename){
 			}
 
 			#same as laststop but for startup message (printed when the server has finished loading all webapps)
-			$laststart = Select-String -Path "$script:sasconfigpath\Web\WebAppServer\$webappsvrname\logs\server.log" -Pattern 'Server startup' | select-object -ExpandProperty LineNumber
+			$laststart = Select-String -Path $serverLog -Pattern 'Server startup' | select-object -ExpandProperty LineNumber
 			if ($null -eq $laststart) {
 				$laststart=0
 			}
@@ -154,14 +221,17 @@ FUNCTION CHECK-WEBAPPSERVER-READY($servicename){
 
 			if ($laststop -gt $lastinit){
 				#if newest thing in log is stop, there was a problem
-				Write-AuditLog -Level "ERROR" -Message "Server initialization does not appear to have started" -ServiceName $servicename
+				$script:ServicesFailed++
+				$script:RunFailed = $true
+				Write-AuditLog -Level "ERROR" -Message "Server initialization does not appear to have started. Log: $serverLog" -ServiceName $servicename
 				write-host("ERROR: Server initialization does not appear to have started. Verify Web Application Server $webappsvrname is running.")
+				Complete-Run -Result "failed"
 				Exit 1
 			}
 			elseif($laststart -gt $lastinit){
 				#if newest thing in log is startup complete, the webappserver is ready
 			   write-host("INFO: $webappsvrname startup detected.")
-			   Write-AuditLog -Level "INFO" -Message "WebAppServer startup completed" -ServiceName $servicename
+			   Write-AuditLog -Level "INFO" -Message "WebAppServer startup completed. Log: $serverLog" -ServiceName $servicename
 			   $finishedstart=1;
 			   Continue
 			}
@@ -174,14 +244,12 @@ FUNCTION CHECK-WEBAPPSERVER-READY($servicename){
 		}
 		while (($finishedstart -ne 1) -and ( $startchecks -le 30))
 			if ($finishedstart -ne 1) {
-					Write-AuditLog -Level "WARN" -Message "WebAppServer startup timeout - may still be deploying" -ServiceName $servicename
+					Write-AuditLog -Level "WARN" -Message "WebAppServer startup timeout after $($startchecks) checks - may still be deploying. Log: $serverLog" -ServiceName $servicename
 					Write-Host ("WARN: Web Application Server $webappsvrname has still not completed startup operations. Some Web Applications may still be unavailable until the WebAppServer has fully completed startup.")
 			}
 	}
 	Else {
-		Write-Host "WARN: Unable to check Web Application Server's deployment of webapps."
-		Write-Host "WARN: Web applications may load errors until this process has completed. Check web application server logs for a startup message to confirm."
-		Write-Host "WARN: This message does NOT indicate an inherent problem with your web application servers. Ensure this script was able to determine SAS Configuration Directory path."
+		Write-AuditLog -Level "WARN" -Message "Skipped deployment check because the SAS configuration directory is not set. Web applications may still be loading. Pass -saslev to enable this check." -ServiceName $servicename
 	}
 }
 
@@ -207,9 +275,7 @@ FUNCTION DETERMINE-SASCONFIG-DIR ($potentialcfgsvc) {
 			Write-AuditLog -Level "INFO" -Message "Determined SAS Configuration Directory: $script:sasconfigpath" -ServiceName $potentialcfgsvc
 	}
 	Else {
-		Write-Host "WARN: Failed to locate using SAS Configuration Directory."
-		Write-Host "WARN: If this message appears for every attempted service, please specify it manually in your command using -cfg option."
-		Write-AuditLog -Level "WARN" -Message "Failed to determine SAS Configuration Directory" -ServiceName $potentialcfgsvc
+		Write-AuditLog -Level "WARN" -Message "Failed to determine SAS Configuration Directory. If this repeats for every service, pass -saslev. Example: -saslev C:\SAS\Config\Lev1" -ServiceName $potentialcfgsvc
 	}
 }
 
@@ -231,7 +297,8 @@ If ($saslev) {
 		Write-Host "`n"
 		Write-Host "ERROR: Alternatively you may leave the -saslev paramater unspecified and the script will attempt to determine it automatically from Windows Services on this host."
 		Write-Host "`n"
-		Exit 1	
+		Complete-Run -Result "failed"
+		Exit 1
 	}
 }
 Else {
@@ -252,6 +319,7 @@ If ($cfg) {
 	Else {
 		Write-AuditLog -Level "ERROR" -Message "Custom startup order file not found: $cfg"
 		Write-Host "ERROR: A custom startup order file was set but the file could not be read. Verify path and permissions."
+		Complete-Run -Result "failed"
 		Exit 1
 	}
 }
@@ -269,7 +337,7 @@ Else {
 		".*object spawner",
 	   #".*Deployment Tester server", #typically not started unless testing your deployment
 		".*JobRunner", #Distributed In-Process Scheduler Job Runner
-		".*Launcher"
+		".*Launcher",
 		".*Workload Orchestrator",
 		".*JMS Broker",
 		".*Cache Locator",
@@ -279,7 +347,7 @@ Else {
 	   #".*Remote Services", # Deprecated Functionality in SAS 9.4
 		".*SASServer1_1", #SASServer1_1 must be before other remaining WebServers, Web Application Server
 		".*WebAppServer", #Remaining Web Application Servers in any order
-		"(?!agent).*Environment Manager", #get EvMgr the server before the agent  (string does not contain 'agent')
+		".*Environment Manager(?!\s+Agent)", #server before the agent; the old (?!agent) only looked at the start of the name
 		".*Environment Manager Agent", #now get the agent
 		".*PC Files",
 		".*Deployment Agent",
@@ -384,39 +452,80 @@ foreach($DefinedService in $StaticStartOrder) { #"outer loop" -> check each obje
 	
 	
 }
-Write-AuditLog -Level "INFO" -Message "Service startup order determined - $($StartOrder.Count) services will be processed"
+$StartOrder = @($StartOrder)
+$orderedNames = @($StartOrder | ForEach-Object { $_.DisplayName })
+$script:ServicesPlanned = $orderedNames.Count
+Write-AuditLog -Level "INFO" -Message "Service order ($($orderedNames.Count)): $($orderedNames -join '; ')" -Action $action
+$candidateServices = @()
+if ($null -ne $GetSASServices) { $candidateServices = @($GetSASServices) }
+$unmatched = @($candidateServices | Where-Object { $orderedNames -notcontains $_.DisplayName })
+if ($unmatched.Count -gt 0) {
+	$unmatchedNames = @($unmatched | ForEach-Object { $_.DisplayName }) -join "; "
+	Write-AuditLog -Level "WARN" -Message "Services present but not included in this run ($($unmatched.Count)): $unmatchedNames"
+}
+if ($script:ServicesPlanned -eq 0) {
+	if ($action -eq "status") {
+		Write-AuditLog -Level "WARN" -Message "No services matched the startup order." -Action $action
+	}
+	else {
+		Write-AuditLog -Level "ERROR" -Message "No services matched the startup order. Nothing was $action." -Action $action
+		Complete-Run -Result "failed"
+		Exit 1
+	}
+}
 
 # setup variables needed by custom function, "StopStart-SASService"  
 If ($action -eq "stop"){
     $waitforstate='stopped'
-    $services=$StartOrder[$StartOrder.count..0] #reverse startup order
-    Write-AuditLog -Level "INFO" -Message "Preparing to stop services in reverse order"
+    if ($StartOrder.Count -gt 0) {
+        $services=$StartOrder[($StartOrder.Count - 1)..0]
+    }
+    else {
+        $services=@()
+    }
+    $stopNames = @($services | ForEach-Object { $_.DisplayName }) -join "; "
+    Write-AuditLog -Level "INFO" -Message "Preparing to stop services in reverse order: $stopNames"
     }
 ElseIf ($action -eq "start"){
     $waitforstate='running'
     $services=$StartOrder
-    Write-AuditLog -Level "INFO" -Message "Preparing to start services in defined order"
+    Write-AuditLog -Level "INFO" -Message "Preparing to start services in defined order: $($orderedNames -join '; ')"
     }
 ElseIf ($action -eq "status"){
 	$services=$StartOrder
-	Write-AuditLog -Level "INFO" -Message "Checking status of all services"
+	Write-AuditLog -Level "INFO" -Message "Checking status of $($orderedNames.Count) services"
 	}
 Else {
-    Write-AuditLog -Level "ERROR" -Message "Unknown action specified: $action"
-    Write-Host -ForegroundColor Red "ERROR: Unknown command defined as action. Valid actions: start , stop , status"
+    Write-AuditLog -Level "ERROR" -Message "Unknown action specified: $action. Valid actions: start, stop, status"
+    Complete-Run -Result "failed"
     Exit 1
 }
 
 # --- Main Action in Script --- 
 # Loop over the function for each service to stop or start 
-Write-AuditLog -Level "INFO" -Message "Starting main action loop for $($services.Count) services"
+Write-AuditLog -Level "INFO" -Message "Starting main action loop for $($script:ServicesPlanned) services" -Action $action
 TRY
 {
 	If ($action -eq "status"){
 		Write-Host "`n"
 		Write-Host -ForegroundColor Green "Current Status of SAS services:"
+		foreach ($service in @($services)) {
+			if ($null -eq $service) { continue }
+			try {
+				$service.Refresh()
+				Write-AuditLog -Level "INFO" -Message "Current status" -ServiceName $service.DisplayName -Action "status" -Status "$($service.Status)"
+			}
+			catch {
+				$script:ServicesFailed++
+				$script:RunFailed = $true
+				Write-AuditLog -Level "ERROR" -Message "Unable to read service status: $($_.Exception.Message)" -ServiceName "$($service.DisplayName)" -Action "status"
+			}
+		}
 		$services | Format-Table -Property Status, Displayname -AutoSize
-		Write-AuditLog -Level "INFO" -Message "Status check completed for $($services.Count) services"
+		if ($script:RunFailed) {
+			throw "ERROR: status could not be read for $($script:ServicesFailed) service(s)."
+		}
+		Write-AuditLog -Level "INFO" -Message "Status check completed for $($script:ServicesPlanned) services"
 	}
 	Else {
     Write-Output '-------------------------------------'
@@ -424,7 +533,7 @@ TRY
     Write-Output '-------------------------------------'
     Write-Host "change the state to $action for:"
     Foreach ($service in $services) {
-        StopStart-SASService -action $action -service $service -waitforstate $waitforstate -verb $verb
+        StopStart-SASService -action $action -service $service -waitforstate $waitforstate
 		
 		#catch webappservers and check if really started
 		If ("$($service.DisplayName)" -match 'WebAppServer' -And $action -eq "start") {
@@ -460,16 +569,14 @@ TRY
     Write-Host -ForegroundColor Green " Script Finished - Current Status of SAS services in order they were $waitforstate :"
     Write-Output '-------------------------------------'
     $services | Format-Table -Property Status, Displayname -AutoSize
-    Write-AuditLog -Level "INFO" -Message "Script completed successfully - all services processed"
 	}
+	Complete-Run -Result "success"
 }
 CATCH
 {
-    Write-Output "An error has occurred. Printing latest error to console:"
-	Write-Host -ForegroundColor Red "$($Error[0])"
-	Write-AuditLog -Level "ERROR" -Message "Script error: $($Error[0])"
-	#Write-Host -ForegroundColor Red "$Error" #DEBUG . Print entire ps error log array, will shows repeats of errors if run multiple times.
+	if (-not $script:RunFailed) { $script:ServicesFailed++ }
+	$script:RunFailed = $true
+	Write-AuditLog -Level "ERROR" -Message "Script error: $($Error[0])" -Action $action
+	Complete-Run -Result "failed"
+	Exit 1
 }
-
-# Log script completion
-Write-AuditLog -Level "INFO" -Message "SAS-wsm script ended"
