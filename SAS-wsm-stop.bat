@@ -7,7 +7,7 @@ net session >nul 2>&1
 if %errorlevel%==0 goto :run
 
 echo Requesting administrator approval to stop SAS services...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -LiteralPath '%~f0' -Verb RunAs"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 if errorlevel 1 (
     echo Administrator approval was not granted.
     pause
