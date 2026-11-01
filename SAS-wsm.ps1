@@ -30,9 +30,8 @@ param([Parameter(Mandatory=$true)]$action,$saslev,$cfg,$LogDirectory)
 ### AUDIT LOGGING SETUP
 # One log file per day. -LogDirectory overrides the default (this script's folder).
 $script:ScriptVersion = "2.2.0"
-$script:LogDirectory = $PSScriptRoot
-if ($LogDirectory) { $script:LogDirectory = $LogDirectory }
-if (-not $script:LogDirectory) { $script:LogDirectory = (Get-Location).Path }
+if (-not $LogDirectory) { $LogDirectory = $PSScriptRoot }
+if (-not $LogDirectory) { $LogDirectory = (Get-Location).Path }
 if (-not (Test-Path -LiteralPath $script:LogDirectory -PathType Container)) {
 	try {
 		New-Item -ItemType Directory -Path $script:LogDirectory -Force -ErrorAction Stop | Out-Null
@@ -260,7 +259,7 @@ FUNCTION DETERMINE-SASCONFIG-DIR ($potentialcfgsvc) {
 	
 	$cfgfilter="Name='" + "$potentialcfgsvc" + "'" #build proper format for upcoming Get-CimInstance call
 	#Write-Host "We built cfgfilter: $cfgfilter" #debug
-	$cfgpathobj=Get-CimInstance -ClassName win32_service -Filter "$cfgfilter" | Select PathName | Out-String #obtains the 'PathName' object on the passed Windows Service.
+	$cfgpathobj=(Get-CimInstance -ClassName win32_service -Filter "$cfgfilter").PathName #obtains the 'PathName' object on the passed Windows Service.
 	
 	If ($cfgpathobj -match '(?<=-config ").*?Lev\d') {
 		#METADATA SERVER. Regex match that takes anything after literal `-config "` and ending on `Lev#`, where # is any single numerical digit. This should result in, for example, C:\SAS\Config\Lev1 , from where the sasv9.cfg is specified in command.
@@ -270,7 +269,7 @@ FUNCTION DETERMINE-SASCONFIG-DIR ($potentialcfgsvc) {
 	}
 	ElseIf ($cfgpathobj -match '\b.*?Lev\d') {
 		#JMS BROKER AND/OR CACHE LOCATOR. Regex match that takes from beginning of word until `Lev#`. This match functions on both services, where the beginning of the PathName is the SASConfig dir. Note this actually returns multiple matches, take the first one (later ones have prepended junk)
-			$script:sasconfigpath=$cfgpathobj -match '^.*?Lev\d' | Foreach {$matches[0]}
+			$script:sasconfigpath=$cfgpathobj -match '^\W*(.*?Lev\d)' | Foreach {$matches[1]}
 			Write-Host "INFO: Successfully determined the SAS Configuration Directory path: $script:sasconfigpath"
 			Write-AuditLog -Level "INFO" -Message "Determined SAS Configuration Directory: $script:sasconfigpath" -ServiceName $potentialcfgsvc
 	}
@@ -367,7 +366,7 @@ Else {
 # create  an object that holds all Windows Services with SAS in the name -  it is unordered 
 # exclude services set to disabled starttype unless service is running
 $GetSASServices = Get-Service | 
-    where-object {$_.displayname -Match "^SAS*|^IBM Spectrum"-and
+    where-object {$_.displayname -Match "^SAS|^IBM Spectrum"-and
     ($_.starttype -NE 'Disabled' -or 
      $_.status -EQ 'running') }
 Write-AuditLog -Level "INFO" -Message "Found $($GetSASServices.Count) SAS services on this system"
